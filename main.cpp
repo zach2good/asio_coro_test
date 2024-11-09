@@ -3,6 +3,7 @@
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
 #include <asio/this_coro.hpp>
+
 #include <chrono>
 #include <iostream>
 #include <memory>
@@ -57,11 +58,6 @@ public:
     , signals_(io_context_main_, SIGINT, SIGTERM)
     {
         TracyZoneScoped;
-
-        // TODO: Manually create the threads that will go into the thread pool, so we can mark
-        // them with Tracy. This is a workaround for the fact that asio::thread_pool does not
-        // allow us to set the thread name.
-
         signals_.async_wait([&](auto, auto)
                             { io_context_main_.stop(); });
     }
@@ -69,18 +65,6 @@ public:
     void run()
     {
         TracyZoneScoped;
-
-        if (!work_main_.owns_work())
-        {
-            spdlog::error("Work guard is not active!");
-        }
-
-        if (io_context_main_.stopped())
-        {
-            spdlog::error("io_context_main_ is stopped before run.");
-            io_context_main_.restart(); // Restart if needed
-        }
-
         io_context_main_.run();
         thread_pool_.join();
     }
@@ -110,21 +94,18 @@ public:
         return worker_executor_;
     }
 
-    // Helper method to run a vector of tasks concurrently
     task<void> when_all_par(std::vector<task<void>>&& tasks)
     {
         std::vector<std::future<void>> futures;
 
-        // Spawn each task and collect the future
         for (auto& t : tasks)
         {
             futures.push_back(asio::co_spawn(worker_executor_, std::move(t), asio::use_future));
         }
 
-        // Wait for all futures to complete
         for (auto& f : futures)
         {
-            f.get(); // Wait for each task to finish
+            f.get();
         }
 
         co_return;
@@ -184,8 +165,9 @@ auto zone_tick(Scheduler& scheduler, int i) -> task<void>
     spdlog::info("Running zone tick {} on thread: {}", i, thread_id_to_string(std::this_thread::get_id()));
     for (int i = 0; i < 1000; ++i)
     {
-        scheduler.run_on_worker_thread([]() -> task<void>
-                                       { co_await entity_tick(); });
+        co_await scheduler.run_on_worker_thread([]() -> task<void> {
+            co_await entity_tick();
+        });
     }
     co_return;
 }
@@ -202,46 +184,14 @@ public:
     void run()
     {
         TracyZoneScoped;
-
-        spdlog::info("Running on the main thread: {}", thread_id_to_string(std::this_thread::get_id()));
-
-        /*
-        // Minimal test task
-        asio::co_spawn(
-            scheduler_.get_main_executor(), [this]() -> task<void>
-            {
-                spdlog::info("Minimal task started.");
-                co_await scheduler_.run_on_worker_thread([this]() -> task<void> {
-                    spdlog::info("Minimal task continued: 1");
-                    co_await scheduler_.run_on_worker_thread([this]() -> task<void> {
-                        spdlog::info("Minimal task continued: 2");
-                        co_await scheduler_.run_on_worker_thread([this]() -> task<void> {
-                            spdlog::info("Minimal task continued: 3");
-                            co_await scheduler_.run_on_worker_thread([this]() -> task<void> {
-                                spdlog::info("Minimal task continued: 4");
-                                co_return;
-                            });
-                        });
-
-                    });
-                });
-                co_return;
-            },
-            asio::detached);
-        */
-
         asio::co_spawn(
             scheduler_.get_main_executor(), [this]() -> task<void>
             {
                 co_await main_thread_task();
-
-                spdlog::info("Releasing work guard on the main thread: {}", thread_id_to_string(std::this_thread::get_id()));
                 scheduler_.release_work_guard(); // Release the work guard after all tasks complete
-
                 co_return; },
-            asio::detached); // This will run on the main thread
-
-        scheduler_.run(); // This will run until all tasks complete.
+            asio::detached);
+        scheduler_.run();
     }
 
 private:
