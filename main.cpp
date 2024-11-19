@@ -7,12 +7,48 @@
 #include <boost/asio/thread_pool.hpp>
 #include <boost/asio/use_awaitable.hpp>
 
+#include <fmt/format.h>
 #include <spdlog/spdlog.h>
 
-#include "tracy/Tracy.hpp"
+
+#include <chrono>
 #include <cstdint>
-#include <fmt/format.h>
+#include <functional>
+#include <future>
+#include <iostream>
+#include <mutex>
+#include <random>
 #include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+
+#include "tracy/Tracy.hpp"
+#include "tracy/TracyC.h"
+
+auto get_thread_name()
+{
+    static std::unordered_map<std::thread::id, std::size_t> thread_ids;
+
+    std::thread::id this_id = std::this_thread::get_id();
+
+    if (thread_ids.find(this_id) == thread_ids.end())
+    {
+        thread_ids[this_id] = thread_ids.size();
+    }
+
+    return thread_ids[this_id] == 0 ? "Main" : "Worker-" + std::to_string(thread_ids[this_id]);
+}
+
+void log(const std::string& message)
+{
+    static std::mutex cout_mutex;
+
+    std::lock_guard<std::mutex> lock(cout_mutex);
+
+    std::cout << "[" << get_thread_name() << "] " << message << std::endl;
+}
 
 #define TracyFrameMark          FrameMark
 #define TracyZoneScoped         ZoneScoped
@@ -24,36 +60,6 @@
 #define TracyZoneCString(cstr)  ZoneText(cstr, std::strlen(cstr))
 #define TracyMessageStr(str)    TracyMessage(str.c_str(), str.size())
 #define TracySetThreadName(str) tracy::SetThreadName(str)
-
-#include <chrono>
-#include <functional>
-#include <future>
-#include <iostream>
-#include <mutex>
-#include <random>
-#include <thread>
-#include <unordered_map>
-#include <vector>
-
-void log(const std::string& message)
-{
-    static std::mutex cout_mutex;
-
-    static std::unordered_map<std::thread::id, std::size_t> thread_ids;
-
-    std::lock_guard<std::mutex> lock(cout_mutex);
-
-    if (thread_ids.find(std::this_thread::get_id()) == thread_ids.end())
-    {
-        thread_ids[std::this_thread::get_id()] = thread_ids.size();
-    }
-
-    const auto thread_id = thread_ids[std::this_thread::get_id()];
-
-    std::string thread_name = thread_id == 0 ? "Main" : "Worker-" + std::to_string(thread_id);
-
-    std::cout << "[" << thread_name << "] " << message << std::endl;
-}
 
 using namespace std::chrono_literals;
 
@@ -132,6 +138,8 @@ public:
 
     task<void> offload_work(std::function<void()> work)
     {
+        TracyZoneScoped;
+
         // Create a promise and a future to synchronize the work
         auto promise = std::promise<void>();
         auto future  = promise.get_future();
@@ -156,6 +164,7 @@ public:
         co_await asio::post(io_context_, asio::use_awaitable);
 
         future.wait(); // Wait for the thread pool work to complete
+
         co_return;
     }
 
@@ -177,24 +186,27 @@ private:
 
 void random_sleep(unsigned int ms)
 {
+    TracyZoneScoped;
+
     std::this_thread::sleep_for(duration_cast<std::chrono::milliseconds>(std::chrono::duration<double>(std::rand() % ms) / 100.0));
+}
+
+void offloaded_work()
+{
+    TracyZoneScoped;
+
+    log("This is offloaded work");
+    random_sleep(100);
 }
 
 task<void> simulate_zone(int zone_id, Scheduler& scheduler)
 {
-    TracyZoneScoped;
-
     log("Simulating zone " + std::to_string(zone_id));
 
-    co_await scheduler.offload_work(
-        [zone_id]
-        {
-            TracyZoneScoped;
-            log("Simulating offloaded workload for zone " + std::to_string(zone_id));
-            random_sleep(100);
-        });
+    co_await scheduler.offload_work(offloaded_work);
 
     log("Zone " + std::to_string(zone_id) + " simulation complete");
+
     co_return;
 }
 
@@ -210,7 +222,7 @@ task<void> some_main_thread_task()
 
 task<void> simulate_zones(Scheduler& scheduler)
 {
-    TracyZoneScoped;
+    // TODO: How do I get Tracy to work here, inside a coroutine?
 
     log("Simulating zones");
 
@@ -219,7 +231,7 @@ task<void> simulate_zones(Scheduler& scheduler)
 
     // Spawn tasks for all zones
     std::vector<task<void>> zone_tasks;
-    for (int zone_id = 0; zone_id < 30; ++zone_id)
+    for (int zone_id = 0; zone_id < 32; ++zone_id)
     {
         zone_tasks.emplace_back(simulate_zone(zone_id, scheduler));
     }
@@ -232,22 +244,27 @@ task<void> simulate_zones(Scheduler& scheduler)
 
 task<void> simulate(Scheduler& scheduler)
 {
+    TracyFiberEnter("Main");
+
     Timer t;
 
+    // These are sequential
     for (int i = 0; i < 3; ++i)
     {
-        TracyFrameMark;
-        TracySetThreadName("Main Thread");
-        TracyZoneScoped;
-
+        TracyFiberLeave;
         co_await simulate_zones(scheduler);
+        TracyFiberEnter("Main");
     }
 
     t.end();
+
+    TracyFiberLeave;
 }
 
 int main()
 {
+    TracyZoneScoped;
+
     Scheduler scheduler({
         .thread_count = 32,
     });

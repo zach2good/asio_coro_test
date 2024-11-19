@@ -3,6 +3,12 @@ cmake_minimum_required(VERSION 3.28)
 project(HeaderOnlyBoost LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(LINKER_LANGUAGE CXX)
+set(USE_FOLDERS ON)
+
+# Generate compile_commands.json to make it easier to work with clang based tools
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 message(STATUS "CMAKE_VERSION: ${CMAKE_VERSION}")
 message(STATUS "CMAKE_C_COMPILER: ${CMAKE_C_COMPILER}")
@@ -15,6 +21,8 @@ message(STATUS "CMAKE_GENERATOR_PLATFORM: ${CMAKE_GENERATOR_PLATFORM}")
 message(STATUS "CMAKE_BUILD_TYPE: ${CMAKE_BUILD_TYPE}")
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+set(CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 
 file(
   DOWNLOAD
@@ -62,6 +70,7 @@ endforeach()
 target_compile_definitions(BoostHeaders INTERFACE
     BOOST_ASIO_DISABLE_BOOST_DATE_TIME
     BOOST_ASIO_NO_DEPRECATED
+    _WIN32_WINNT=0x0601
 )
 
 # We want to use a different and more modern version of Boost.ASIO (1.87.0.beta1)
