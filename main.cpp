@@ -10,7 +10,6 @@
 #include <fmt/format.h>
 #include <spdlog/spdlog.h>
 
-
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -22,10 +21,62 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
-
+#include <mutex>
+#include <shared_mutex>
 
 #include "tracy/Tracy.hpp"
 #include "tracy/TracyC.h"
+
+// https://www.reddit.com/r/cpp/comments/p132c7/comment/h8b8nml/?share_id=-NRyj9iRw5TqSi4Mm381j
+template <
+    class T,
+    class Mutex                            = std::mutex,
+    template <typename...> typename WriteLock = std::unique_lock,
+    template <typename...> typename ReadLock = std::unique_lock>
+struct Synchronised
+{
+    Synchronised()  = default;
+    ~Synchronised() = default;
+
+    explicit Synchronised(T in)
+    : target(std::move(in))
+    {
+    }
+
+    auto read(auto f) const
+    {
+        auto l = lock();
+        LockMark(mutex);
+        return f(target);
+    }
+
+    auto get_copy() const
+    {
+        return read([&](const auto& obj) { return obj; });
+    }
+
+    auto write(auto f)
+    {
+        auto l = lock();
+        LockMark(mutex);
+        return f(target);
+    }
+
+private:
+    mutable TracyLockable(Mutex, mutex);
+
+    T target;
+
+    auto lock() const
+    {
+        return ReadLock<LockableBase(Mutex)>(mutex);
+    }
+
+    auto lock()
+    {
+        return WriteLock<LockableBase(Mutex)>(mutex);
+    }
+};
 
 auto get_thread_name()
 {
@@ -74,6 +125,9 @@ enum class WhenAllShuffleMode
     None,
     Shuffle,
 };
+
+// Locked, shared resource
+Synchronised<int> g_zone_counter{};
 
 asio::awaitable<void> when_all(std::vector<asio::awaitable<void>> tasks, WhenAllShuffleMode shuffle_mode = WhenAllShuffleMode::None)
 {
@@ -136,12 +190,15 @@ public:
         thread_pool_.stop();
     }
 
-    task<void> offload_work(std::function<void()> work)
+    template <typename Func>
+    auto offload_work(Func&& work) -> task<std::invoke_result_t<Func>>
     {
+        using result_type = std::invoke_result_t<Func>;
+
         TracyZoneScoped;
 
         // Create a promise and a future to synchronize the work
-        auto promise = std::promise<void>();
+        auto promise = std::promise<result_type>();
         auto future  = promise.get_future();
 
         // Schedule the work in the thread pool
@@ -151,8 +208,16 @@ public:
             {
                 try
                 {
-                    work(); // Perform the actual work
-                    promise.set_value();
+                    if constexpr (std::is_same_v<result_type, void>)
+                    {
+                        work(); // Perform the actual work
+                        promise.set_value();
+                    }
+                    else
+                    {
+                        result_type result = work(); // Perform the actual work
+                        promise.set_value(std::move(result));
+                    }
                 }
                 catch (...)
                 {
@@ -165,7 +230,14 @@ public:
 
         future.wait(); // Wait for the thread pool work to complete
 
-        co_return;
+        if constexpr (std::is_void_v<result_type>)
+        {
+            co_return;
+        }
+        else
+        {
+            co_return future.get(); // Return the result of the work
+        }
     }
 
     void run()
@@ -191,19 +263,36 @@ void random_sleep(unsigned int ms)
     std::this_thread::sleep_for(duration_cast<std::chrono::milliseconds>(std::chrono::duration<double>(std::rand() % ms) / 100.0));
 }
 
-void offloaded_work()
+auto offloaded_work()
 {
     TracyZoneScoped;
 
     log("This is offloaded work");
     random_sleep(100);
+
+    return 42;
 }
 
 task<void> simulate_zone(int zone_id, Scheduler& scheduler)
 {
     log("Simulating zone " + std::to_string(zone_id));
 
-    co_await scheduler.offload_work(offloaded_work);
+    // With a return value
+    auto result = co_await scheduler.offload_work(offloaded_work);
+    log("Result: " + std::to_string(result));
+
+    // With void
+    co_await scheduler.offload_work([&]() {
+        TracyZoneScoped;
+
+        log("This is offloaded work");
+
+        g_zone_counter.write([](auto& counter) {
+            counter++;
+        });
+
+        random_sleep(100);
+    });
 
     log("Zone " + std::to_string(zone_id) + " simulation complete");
 
@@ -240,6 +329,9 @@ task<void> simulate_zones(Scheduler& scheduler)
     co_await when_all(std::move(zone_tasks));
 
     log("*** All zones have finished simulating ***");
+
+    auto counter = g_zone_counter.get_copy();
+    log("Zone counter: " + std::to_string(counter));
 }
 
 task<void> simulate(Scheduler& scheduler)
