@@ -6,6 +6,10 @@
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/thread_pool.hpp>
 #include <boost/asio/use_awaitable.hpp>
+#include <boost/asio/streambuf.hpp>
+#include <boost/asio/posix/stream_descriptor.hpp>
+#include <boost/asio/windows/stream_handle.hpp>
+#include <boost/asio.hpp>
 
 #include <fmt/format.h>
 #include <spdlog/spdlog.h>
@@ -169,6 +173,68 @@ public:
 
 private:
     std::chrono::time_point<std::chrono::steady_clock> start_time_;
+};
+
+class Console
+{
+public:
+    Console(boost::asio::io_context& io_context)
+        : io_context(io_context),
+#ifdef _WIN32
+          input_handle(io_context, ::GetStdHandle(STD_INPUT_HANDLE))
+#else
+          input_handle(io_context, ::dup(STDIN_FILENO))
+#endif
+    {
+        start_reading();
+    }
+
+    void start_reading() {
+        boost::asio::async_read_until(input_handle, input_buffer, '\n',
+            // Completion handler
+            [this](const boost::system::error_code& error, std::size_t length) {
+                this->handle_read(error, length);
+            });
+    }
+
+    void handle_read(const boost::system::error_code& error, std::size_t length) {
+        if (error) {
+            std::cerr << "Error: " << error.message() << std::endl;
+            return;
+        }
+
+        std::istream is(&input_buffer);
+        std::string line;
+        std::getline(is, line);
+
+        const auto trim = [](const std::string& str) {
+            std::string out;
+            out.reserve(str.size());
+            for (const auto& c : str) {
+                if (c != '\n' && c != '\r' && c != '\t') {
+                    out.push_back(c);
+                }
+            }
+            return out;
+        };
+
+        line = trim(line);
+
+        std::cout << "Received: " << line << std::endl;
+
+        // Start reading again
+        start_reading();
+    }
+
+private:
+    boost::asio::io_context& io_context;
+    boost::asio::streambuf input_buffer;
+
+#ifdef _WIN32
+    boost::asio::windows::stream_handle input_handle;
+#else
+    boost::asio::posix::stream_descriptor input_handle;
+#endif
 };
 
 class Scheduler
@@ -350,6 +416,8 @@ task<void> simulate(Scheduler& scheduler)
 
     t.end();
 
+    scheduler.get_io_context().stop();
+
     TracyFiberLeave;
 }
 
@@ -381,6 +449,17 @@ int main()
                 }
             }
         });
+
+    Console console(scheduler.get_io_context());
+
+    auto signal_set = asio::signal_set(scheduler.get_io_context(), SIGINT, SIGTERM);
+    signal_set.async_wait([&](const boost::system::error_code& error, int signal_number) {
+        log("Received signal: " + std::to_string(signal_number));
+        if (error) {
+            log("Error: " + error.message());
+        }
+        scheduler.get_io_context().stop();
+    });
 
     scheduler.run();
 
